@@ -31,6 +31,7 @@ interface BrowserPageSummary {
 
 type BrowserManagerDependencies = {
   connectOverCDP: typeof chromium.connectOverCDP;
+  createWebSocket: (url: string) => CdpProbeSocket;
   fetch: typeof globalThis.fetch;
   homedir: () => string;
   launchPersistentContext: typeof chromium.launchPersistentContext;
@@ -38,6 +39,15 @@ type BrowserManagerDependencies = {
   platform: NodeJS.Platform;
   readFile: typeof readFile;
 };
+
+interface CdpProbeSocket {
+  close: (code?: number, reason?: string) => void;
+  onclose: ((event: { code?: number; reason?: string }) => void) | null;
+  onerror: ((event: { error?: unknown; message?: string }) => void) | null;
+  onmessage: ((event: { data?: unknown }) => void) | null;
+  onopen: (() => void) | null;
+  send: (data: string) => void;
+}
 
 type DebuggerWebSocketLookupResult =
   | {
@@ -50,6 +60,7 @@ type DebuggerWebSocketLookupResult =
 
 const DISCOVERY_PORTS = [9222, 9223, 9224, 9225, 9226, 9227, 9228, 9229];
 const PROBE_TIMEOUT_MS = 750;
+const CDP_HEALTH_PROBE_TIMEOUT_MS = 3_000;
 const MANUAL_CONNECT_TIMEOUT_MS = 5_000;
 const PAGE_TITLE_TIMEOUT_MS = 1_500;
 const TARGET_ID_PATTERN = /^[a-f0-9]{16,}$/i;
@@ -75,6 +86,7 @@ export class BrowserManager {
     this.baseDir = baseDir;
     this.dependencies = {
       connectOverCDP: chromium.connectOverCDP.bind(chromium) as typeof chromium.connectOverCDP,
+      createWebSocket: (url) => new WebSocket(url) as unknown as CdpProbeSocket,
       fetch: globalThis.fetch,
       homedir: os.homedir,
       launchPersistentContext: chromium.launchPersistentContext.bind(
@@ -386,6 +398,10 @@ export class BrowserManager {
   }
 
   private async openConnectedBrowser(name: string, endpoint: string): Promise<BrowserEntry> {
+    if (endpoint.startsWith("ws://") || endpoint.startsWith("wss://")) {
+      await this.probeCdpEndpoint(endpoint);
+    }
+
     const browser = await this.dependencies.connectOverCDP(endpoint);
     const contexts = browser.contexts();
 
@@ -484,11 +500,103 @@ export class BrowserManager {
       return result.webSocketDebuggerUrl;
     }
 
-    if (result.status === "not-found") {
+    if (result.status === "not-found" || result.status === "unavailable") {
       return this.readDevToolsActivePort(port);
     }
 
     return null;
+  }
+
+  private async probeCdpEndpoint(
+    endpoint: string,
+    timeoutMs = CDP_HEALTH_PROBE_TIMEOUT_MS
+  ): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const socket = this.dependencies.createWebSocket(endpoint);
+
+      const finish = (callback: () => void) => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        clearTimeout(timer);
+        socket.onopen = null;
+        socket.onmessage = null;
+        socket.onerror = null;
+        socket.onclose = null;
+        callback();
+      };
+      const closeSocket = () => {
+        try {
+          socket.close();
+        } catch {
+          // Best effort during probe cleanup.
+        }
+      };
+      const timeoutError = () =>
+        new Error(
+          `Chrome CDP endpoint ${endpoint} accepted a WebSocket connection but did not respond to Browser.getVersion within ${timeoutMs}ms.\n` +
+            "This usually means the Chrome CDP target is stale or unhealthy.\n" +
+            "Chrome 136+ may do this on the default profile. Relaunch Chrome with " +
+            "--remote-debugging-port=9222 --user-data-dir=<custom-path>, or use Chrome for Testing."
+        );
+      const normalizeError = (reason: unknown) => {
+        if (reason instanceof Error) {
+          return reason;
+        }
+
+        const message =
+          typeof reason === "object" &&
+          reason !== null &&
+          "message" in reason &&
+          typeof (reason as { message?: unknown }).message === "string"
+            ? (reason as { message: string }).message
+            : String(reason);
+        return new Error(`Chrome CDP WebSocket probe failed for ${endpoint}: ${message}`);
+      };
+
+      const timer = setTimeout(() => {
+        finish(() => {
+          closeSocket();
+          reject(timeoutError());
+        });
+      }, timeoutMs);
+
+      socket.onopen = () => {
+        try {
+          socket.send(JSON.stringify({ id: 1, method: "Browser.getVersion" }));
+        } catch (error) {
+          finish(() => {
+            closeSocket();
+            reject(normalizeError(error));
+          });
+        }
+      };
+      socket.onmessage = () => {
+        finish(() => {
+          closeSocket();
+          resolve();
+        });
+      };
+      socket.onerror = (event) => {
+        finish(() => {
+          closeSocket();
+          reject(normalizeError(event.error ?? event.message ?? "unknown websocket error"));
+        });
+      };
+      socket.onclose = (event) => {
+        finish(() => {
+          reject(
+            new Error(
+              `Chrome CDP endpoint ${endpoint} closed before responding to Browser.getVersion` +
+                (event.reason ? ` (${event.reason})` : "")
+            )
+          );
+        });
+      };
+    });
   }
 
   private getDevToolsActivePortCandidates(): string[] {

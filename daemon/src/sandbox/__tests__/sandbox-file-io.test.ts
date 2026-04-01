@@ -174,6 +174,55 @@ describe.sequential("QuickJS sandbox file I/O", () => {
     expect(await readFileFs(result.savedPath, "utf8")).toBe(result.content);
   });
 
+  it("reads controlled temp files as base64", async () => {
+    const requestedName = "sandbox file io data.bin";
+    const expectedPath = await resolveDevBrowserTempPath(requestedName);
+    cleanupPaths.add(expectedPath);
+
+    const output = await runSandboxScript(`
+      const bytes = new Uint8Array([0, 1, 2, 255]);
+      const savedPath = await writeFile(${JSON.stringify(requestedName)}, bytes);
+      const base64 = await readFile(${JSON.stringify(requestedName)}, "base64");
+      console.log(JSON.stringify({ savedPath, base64 }));
+    `);
+
+    const result = parseLastJsonLine<{ savedPath: string; base64: string }>(output);
+    expect(result.savedPath).toBe(expectedPath);
+    expect(result.base64).toBe(Buffer.from([0, 1, 2, 255]).toString("base64"));
+  });
+
+  it("uploads staged files through the host uploadFile helper", async () => {
+    const requestedName = "sandbox upload bundle.md";
+    const expectedPath = await resolveDevBrowserTempPath(requestedName);
+    cleanupPaths.add(expectedPath);
+
+    const output = await runSandboxScript(`
+      await writeFile(${JSON.stringify(requestedName)}, "# Upload\\n\\nHello from QuickJS.");
+      const page = await browser.getPage("file-io-upload");
+      await page.setContent('<input id="upload" type="file" />');
+      await uploadFile(page, ${JSON.stringify(requestedName)}, {
+        selector: "#upload",
+        name: "bundle.md",
+        mimeType: "text/markdown",
+      });
+      const uploaded = await page.evaluate(async () => {
+        const input = document.querySelector("#upload");
+        const file = input instanceof HTMLInputElement ? input.files?.[0] ?? null : null;
+        return {
+          name: file?.name ?? null,
+          text: file ? await file.text() : null,
+        };
+      });
+      console.log(JSON.stringify(uploaded));
+    `);
+
+    const result = parseLastJsonLine<{ name: string | null; text: string | null }>(output);
+    expect(result).toEqual({
+      name: "bundle.md",
+      text: "# Upload\n\nHello from QuickJS.",
+    });
+  });
+
   it("sanitizes harmless filename characters before writing", async () => {
     const requestedName = "report 2026:03:18?.json";
     const expectedPath = await resolveDevBrowserTempPath(requestedName);

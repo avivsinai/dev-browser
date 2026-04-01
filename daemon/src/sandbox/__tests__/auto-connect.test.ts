@@ -135,6 +135,56 @@ class MockBrowser extends EventEmitter {
   }
 }
 
+class MockProbeSocket {
+  onclose: ((event: { code?: number; reason?: string }) => void) | null = null;
+  onerror: ((event: { error?: unknown; message?: string }) => void) | null = null;
+  onmessage: ((event: { data?: unknown }) => void) | null = null;
+  onopen: (() => void) | null = null;
+  readonly sent: string[] = [];
+
+  constructor(
+    private readonly behavior: "respond" | "timeout" | "error" | "close" = "respond",
+    private readonly errorMessage = "probe failed"
+  ) {
+    queueMicrotask(() => {
+      this.onopen?.();
+    });
+  }
+
+  send(data: string): void {
+    this.sent.push(data);
+
+    switch (this.behavior) {
+      case "respond":
+        queueMicrotask(() => {
+          this.onmessage?.({
+            data: JSON.stringify({ id: 1, result: { product: "Chrome/136.0.0.0" } }),
+          });
+        });
+        break;
+      case "error":
+        queueMicrotask(() => {
+          this.onerror?.({
+            message: this.errorMessage,
+          });
+        });
+        break;
+      case "close":
+        queueMicrotask(() => {
+          this.onclose?.({
+            code: 1006,
+            reason: this.errorMessage,
+          });
+        });
+        break;
+      case "timeout":
+        break;
+    }
+  }
+
+  close(): void {}
+}
+
 type BrowserManagerInternals = {
   readDevToolsActivePort(expectedPort?: number): Promise<string | null>;
   discoverChrome(): Promise<string | null>;
@@ -152,6 +202,7 @@ function createEnoentError(filePath: string): NodeJS.ErrnoException {
 function createManager(
   options: {
     connectOverCDP?: ReturnType<typeof vi.fn>;
+    createWebSocket?: ReturnType<typeof vi.fn>;
     fetch?: typeof globalThis.fetch;
     homedir?: () => string;
     launchPersistentContext?: ReturnType<typeof vi.fn>;
@@ -160,6 +211,9 @@ function createManager(
   } = {}
 ) {
   const connectOverCDP = options.connectOverCDP ?? vi.fn();
+  const createWebSocket =
+    options.createWebSocket ??
+    (vi.fn((_url: string) => new MockProbeSocket("respond")) as ReturnType<typeof vi.fn>);
   const fetch =
     options.fetch ??
     (vi.fn(async () => {
@@ -175,6 +229,7 @@ function createManager(
 
   const manager = new BrowserManager(path.join("/tmp", "dev-browser-auto-connect-tests"), {
     connectOverCDP: connectOverCDP as never,
+    createWebSocket: createWebSocket as never,
     fetch,
     homedir: options.homedir ?? (() => "/Users/tester"),
     launchPersistentContext: launchPersistentContext as never,
@@ -186,6 +241,7 @@ function createManager(
   return {
     manager,
     connectOverCDP,
+    createWebSocket,
     fetch,
     launchPersistentContext,
     readFile,
@@ -497,6 +553,50 @@ describe("BrowserManager auto-connect", () => {
     ]);
   });
 
+  it("probes websocket CDP endpoints before calling connectOverCDP", async () => {
+    const browser = new MockBrowser([new MockContext()]);
+    const connectOverCDP = vi.fn(async () => browser);
+    const createWebSocket = vi.fn((url: string) => new MockProbeSocket("respond"));
+    const { manager } = createManager({
+      connectOverCDP,
+      createWebSocket,
+    });
+
+    await manager.connectBrowser("attached", "ws://127.0.0.1:9222/devtools/browser/healthy");
+
+    expect(createWebSocket).toHaveBeenCalledWith("ws://127.0.0.1:9222/devtools/browser/healthy");
+    expect(connectOverCDP).toHaveBeenCalledWith("ws://127.0.0.1:9222/devtools/browser/healthy");
+    const socket = createWebSocket.mock.results[0]?.value as MockProbeSocket;
+    expect(socket.sent).toEqual([JSON.stringify({ id: 1, method: "Browser.getVersion" })]);
+  });
+
+  it("surfaces a clear error when the websocket probe times out", async () => {
+    vi.useFakeTimers();
+
+    try {
+      const browser = new MockBrowser([new MockContext()]);
+      const connectOverCDP = vi.fn(async () => browser);
+      const createWebSocket = vi.fn((url: string) => new MockProbeSocket("timeout"));
+      const { manager } = createManager({
+        connectOverCDP,
+        createWebSocket,
+      });
+
+      const connection = manager.connectBrowser(
+        "attached",
+        "ws://127.0.0.1:9222/devtools/browser/poisoned"
+      );
+      const rejection = expect(connection).rejects.toThrow(/did not respond to Browser\.getVersion/i);
+      await vi.runAllTicks();
+      await vi.advanceTimersByTimeAsync(3_001);
+
+      await rejection;
+      expect(connectOverCDP).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("getBrowser returns connected entries without relaunching them", async () => {
     const browser = new MockBrowser([new MockContext()]);
     const connectOverCDP = vi.fn(async () => browser);
@@ -556,6 +656,43 @@ describe("BrowserManager auto-connect", () => {
     await manager.connectBrowser("attached", "http://127.0.0.1:9222");
 
     expect(connectOverCDP).toHaveBeenCalledWith(
+      "ws://127.0.0.1:9222/devtools/browser/from-active-port"
+    );
+  });
+
+  it("probePort falls back to DevToolsActivePort when /json/version is unavailable", async () => {
+    const homeDir = "/Users/tester";
+    const devToolsPath = path.join(
+      homeDir,
+      "Library",
+      "Application Support",
+      "Google",
+      "Chrome",
+      "DevToolsActivePort"
+    );
+    const readFile = vi.fn(async (filePath: string) => {
+      if (filePath === devToolsPath) {
+        return "9222\n/devtools/browser/from-active-port\n";
+      }
+
+      throw createEnoentError(filePath);
+    });
+    const fetch = vi.fn(
+      async () =>
+        new Response(JSON.stringify({}), {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+          },
+        })
+    ) as typeof globalThis.fetch;
+    const { manager } = createManager({
+      fetch,
+      homedir: () => homeDir,
+      readFile,
+    });
+
+    await expect(getInternals(manager).probePort(9222)).resolves.toBe(
       "ws://127.0.0.1:9222/devtools/browser/from-active-port"
     );
   });

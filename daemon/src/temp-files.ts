@@ -8,6 +8,7 @@ const NOFOLLOW_FLAG = constants.O_NOFOLLOW ?? 0;
 
 export const DEV_BROWSER_BASE_DIR = getDevBrowserBaseDir();
 export const DEV_BROWSER_TMP_DIR = path.join(DEV_BROWSER_BASE_DIR, "tmp");
+type TempFileEncoding = "utf8" | "base64";
 
 function requireNonEmptyString(value: unknown, label: string): string {
   if (typeof value !== "string" || value.length === 0) {
@@ -188,16 +189,18 @@ export async function writeDevBrowserTempFile(
   return destinationPath;
 }
 
-export async function readDevBrowserTempFile(fileName: unknown): Promise<string> {
+export async function readDevBrowserTempFile(
+  fileName: unknown,
+  encoding: TempFileEncoding = "utf8"
+): Promise<string> {
   const destinationPath = await resolveDevBrowserTempPath(fileName);
   await assertDestinationIsNotSymlink(destinationPath);
 
   let handle: FileHandle | undefined;
   try {
     handle = await open(destinationPath, constants.O_RDONLY | NOFOLLOW_FLAG);
-    return await handle.readFile({
-      encoding: "utf8",
-    });
+    const buffer = await handle.readFile();
+    return buffer.toString(encoding);
   } catch (error) {
     throw normalizeSymlinkError(error, destinationPath);
   } finally {

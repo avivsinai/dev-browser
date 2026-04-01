@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import path from "node:path";
 import util from "node:util";
 
 import type { Page } from "playwright";
@@ -7,6 +8,7 @@ import type { BrowserManager } from "../browser-manager.js";
 import {
   ensureDevBrowserTempDir,
   readDevBrowserTempFile,
+  resolveDevBrowserTempPath,
   writeDevBrowserTempFile,
 } from "../temp-files.js";
 import { HostBridge } from "./host-bridge.js";
@@ -211,8 +213,10 @@ export class QuickJSSandbox {
           listPages: () => this.#options.manager.listPages(this.#options.browserName),
           closePage: (name) => this.#closePage(name),
           saveScreenshot: (name, data) => this.#writeTempFile(name, data),
+          uploadFile: (pageGuid, fileName, selector, uploadName, mimeType) =>
+            this.#uploadTempFile(pageGuid, fileName, selector, uploadName, mimeType),
           writeFile: (name, data) => this.#writeTempFile(name, data),
-          readFile: (name) => this.#readTempFile(name),
+          readFile: (name, encoding) => this.#readTempFile(name, encoding),
         },
         onConsole: (level, args) => {
           this.#routeConsole(level, args);
@@ -512,8 +516,38 @@ export class QuickJSSandbox {
                   writable: false,
                 },
                 readFile: {
-                  value: async (name) => {
-                    return await hostCall("readFile", JSON.stringify([name]));
+                  value: async (name, encoding) => {
+                    return await hostCall("readFile", JSON.stringify([name, encoding]));
+                  },
+                  configurable: false,
+                  enumerable: true,
+                  writable: false,
+                },
+                uploadFile: {
+                  value: async (page, fileName, options = {}) => {
+                    const pageGuid =
+                      page && typeof page === "object" && typeof page._guid === "string"
+                        ? page._guid
+                        : null;
+                    if (!pageGuid) {
+                      throw new Error("uploadFile requires a Playwright page object");
+                    }
+                    const selector =
+                      options && typeof options.selector === "string" && options.selector.length > 0
+                        ? options.selector
+                        : "input[type='file']";
+                    const uploadName =
+                      options && typeof options.name === "string" && options.name.length > 0
+                        ? options.name
+                        : undefined;
+                    const mimeType =
+                      options && typeof options.mimeType === "string" && options.mimeType.length > 0
+                        ? options.mimeType
+                        : undefined;
+                    return await hostCall(
+                      "uploadFile",
+                      JSON.stringify([pageGuid, fileName, selector, uploadName, mimeType]),
+                    );
                   },
                   configurable: false,
                   enumerable: true,
@@ -697,8 +731,60 @@ export class QuickJSSandbox {
     );
   }
 
-  async #readTempFile(name: unknown): Promise<string> {
-    return await readDevBrowserTempFile(requireString(name, "File name"));
+  async #readTempFile(name: unknown, encoding: unknown): Promise<string> {
+    const normalizedEncoding =
+      encoding === undefined ? "utf8" : requireString(encoding, "File encoding");
+    if (normalizedEncoding !== "utf8" && normalizedEncoding !== "base64") {
+      throw new Error(`Unsupported file encoding "${normalizedEncoding}"`);
+    }
+
+    return await readDevBrowserTempFile(
+      requireString(name, "File name"),
+      normalizedEncoding
+    );
+  }
+
+  #resolvePageByGuid(guid: unknown): Page {
+    const pageGuid = requireString(guid, "Page guid");
+    const browserEntry = this.#options.manager.getBrowser(this.#options.browserName);
+    if (!browserEntry) {
+      throw new Error(`Browser "${this.#options.browserName}" is not running`);
+    }
+
+    for (const browserContext of browserEntry.browser.contexts()) {
+      for (const page of browserContext.pages()) {
+        if (extractGuid(page) === pageGuid) {
+          return page;
+        }
+      }
+    }
+
+    throw new Error(`Could not resolve page ${pageGuid} in browser "${this.#options.browserName}"`);
+  }
+
+  async #uploadTempFile(
+    pageGuid: unknown,
+    fileName: unknown,
+    selector: unknown,
+    uploadName: unknown,
+    mimeType: unknown
+  ): Promise<void> {
+    const page = this.#resolvePageByGuid(pageGuid);
+    const tempPath = await resolveDevBrowserTempPath(requireString(fileName, "File name"));
+    const uploadBuffer = await readFile(tempPath);
+    const selectorText = requireString(selector, "Upload selector");
+    const finalName =
+      typeof uploadName === "string" && uploadName.length > 0
+        ? uploadName
+        : path.basename(tempPath);
+    const finalMimeType =
+      typeof mimeType === "string" && mimeType.length > 0 ? mimeType : "application/octet-stream";
+
+    await page.locator(selectorText).first().setInputFiles({
+      name: finalName,
+      mimeType: finalMimeType,
+      buffer: uploadBuffer,
+    });
   }
 
   async #cleanupAnonymousPages(options: { suppressErrors?: boolean } = {}): Promise<void> {
