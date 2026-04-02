@@ -61,6 +61,7 @@ type DebuggerWebSocketLookupResult =
 const DISCOVERY_PORTS = [9222, 9223, 9224, 9225, 9226, 9227, 9228, 9229];
 const PROBE_TIMEOUT_MS = 750;
 const CDP_HEALTH_PROBE_TIMEOUT_MS = 3_000;
+const CONNECTED_CONTEXT_TIMEOUT_MS = 5_000;
 const MANUAL_CONNECT_TIMEOUT_MS = 5_000;
 const PAGE_TITLE_TIMEOUT_MS = 1_500;
 const TARGET_ID_PATTERN = /^[a-f0-9]{16,}$/i;
@@ -153,7 +154,7 @@ export class BrowserManager {
       attemptedEndpoints.add(endpoint);
 
       try {
-        return await this.openConnectedBrowser(name, endpoint);
+        return await this.openConnectedBrowser(name, endpoint, { probeWs: false });
       } catch (error) {
         lastError = error;
         return null;
@@ -226,6 +227,12 @@ export class BrowserManager {
       if (page) {
         return page;
       }
+    }
+
+    const reusableBlankPage = this.findReusableBlankPage(entry);
+    if (reusableBlankPage) {
+      this.registerNamedPage(entry, pageNameOrId, reusableBlankPage);
+      return reusableBlankPage;
     }
 
     const page = await entry.context.newPage();
@@ -397,12 +404,22 @@ export class BrowserManager {
     return entry;
   }
 
-  private async openConnectedBrowser(name: string, endpoint: string): Promise<BrowserEntry> {
-    if (endpoint.startsWith("ws://") || endpoint.startsWith("wss://")) {
+  private async openConnectedBrowser(
+    name: string,
+    endpoint: string,
+    options: {
+      probeWs?: boolean;
+    } = {}
+  ): Promise<BrowserEntry> {
+    if (
+      options.probeWs !== false &&
+      (endpoint.startsWith("ws://") || endpoint.startsWith("wss://"))
+    ) {
       await this.probeCdpEndpoint(endpoint);
     }
 
     const browser = await this.dependencies.connectOverCDP(endpoint);
+    const context = await this.waitForConnectedContext(browser);
     const contexts = browser.contexts();
 
     // Enumerate existing tabs for connected browsers, but leave them unnamed so getPage(name)
@@ -410,8 +427,6 @@ export class BrowserManager {
     for (const browserContext of contexts) {
       browserContext.pages();
     }
-
-    const context = contexts[0] ?? (await browser.newContext());
 
     const entry: BrowserEntry = {
       name,
@@ -427,6 +442,51 @@ export class BrowserManager {
     this.attachBrowserLifecycle(entry);
     this.browsers.set(name, entry);
     return entry;
+  }
+
+  private async waitForConnectedContext(browser: Browser): Promise<BrowserContext> {
+    const existingContext = browser.contexts()[0];
+    if (existingContext) {
+      return existingContext;
+    }
+
+    const eventedBrowser = browser as Browser & {
+      off(event: "context", listener: (context: BrowserContext) => void): Browser;
+      on(event: "context", listener: (context: BrowserContext) => void): Browser;
+    };
+
+    return await new Promise<BrowserContext>((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => {
+        clearTimeout(timer);
+        eventedBrowser.off("context", onContext);
+      };
+      const finish = (callback: () => void) => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        cleanup();
+        callback();
+      };
+      const onContext = (context: BrowserContext) => {
+        finish(() => {
+          resolve(context);
+        });
+      };
+      const timer = setTimeout(() => {
+        finish(() => {
+          reject(
+            new Error(
+              "Default browser context did not appear after connectOverCDP. Chrome may not be fully initialized."
+            )
+          );
+        });
+      }, CONNECTED_CONTEXT_TIMEOUT_MS);
+
+      eventedBrowser.on("context", onContext);
+    });
   }
 
   private attachBrowserLifecycle(entry: BrowserEntry): void {
@@ -895,6 +955,19 @@ export class BrowserManager {
     }
 
     return namesByPage;
+  }
+
+  private findReusableBlankPage(entry: BrowserEntry): Page | null {
+    if (entry.type !== "connected") {
+      return null;
+    }
+
+    const namesByPage = this.getNamedPagesByPage(entry);
+    const blankPages = this.getContextPages(entry)
+      .map(({ page }) => page)
+      .filter((page) => !namesByPage.has(page) && page.url() === "about:blank");
+
+    return blankPages.length === 1 ? (blankPages[0] ?? null) : null;
   }
 
   private getBrowserContexts(entry: BrowserEntry): BrowserContext[] {

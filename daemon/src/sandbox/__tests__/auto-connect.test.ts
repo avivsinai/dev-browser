@@ -106,15 +106,25 @@ class MockBrowser extends EventEmitter {
   constructor(contexts: MockContext[] = []) {
     super();
     this.contextsList = contexts;
+    for (const context of contexts) {
+      context.setBrowser(this);
+    }
   }
 
   contexts(): MockContext[] {
     return this.contextsList;
   }
 
+  addContext(context: MockContext): void {
+    context.setBrowser(this);
+    this.contextsList.push(context);
+    this.emit("context", context);
+  }
+
   async newContext(): Promise<MockContext> {
     this.newContextCalls += 1;
     const context = new MockContext();
+    context.setBrowser(this);
     this.contextsList.push(context);
     return context;
   }
@@ -553,6 +563,53 @@ describe("BrowserManager auto-connect", () => {
     ]);
   });
 
+  it("reuses a single blank connected tab for the first named page", async () => {
+    const existingPage = new MockPage();
+    const context = new MockContext([existingPage]);
+    const browser = new MockBrowser([context]);
+    const connectOverCDP = vi.fn(async () => browser);
+    const fetch = vi.fn(async (input: RequestInfo | URL) => {
+      expect(String(input)).toBe("http://127.0.0.1:9222/json/version");
+      return new Response(
+        JSON.stringify({
+          webSocketDebuggerUrl: "ws://127.0.0.1:9222/devtools/browser/connected-browser",
+        }),
+        {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+          },
+        }
+      );
+    }) as typeof globalThis.fetch;
+    const { manager } = createManager({
+      connectOverCDP,
+      fetch,
+    });
+
+    await manager.connectBrowser("attached", "http://127.0.0.1:9222");
+    const namedPage = await manager.getPage("attached", "dashboard");
+
+    expect(namedPage).toBe(existingPage);
+    expect(context.newPageCalls).toBe(0);
+    await expect(manager.listPages("attached")).resolves.toEqual([
+      {
+        id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        name: "dashboard",
+        title: "",
+        url: "about:blank",
+      },
+    ]);
+    expect(manager.listBrowsers()).toEqual([
+      {
+        name: "attached",
+        pages: ["dashboard"],
+        status: "connected",
+        type: "connected",
+      },
+    ]);
+  });
+
   it("probes websocket CDP endpoints before calling connectOverCDP", async () => {
     const browser = new MockBrowser([new MockContext()]);
     const connectOverCDP = vi.fn(async () => browser);
@@ -568,6 +625,30 @@ describe("BrowserManager auto-connect", () => {
     expect(connectOverCDP).toHaveBeenCalledWith("ws://127.0.0.1:9222/devtools/browser/healthy");
     const socket = createWebSocket.mock.results[0]?.value as MockProbeSocket;
     expect(socket.sent).toEqual([JSON.stringify({ id: 1, method: "Browser.getVersion" })]);
+  });
+
+  it("waits for the connected browser default context instead of creating a new one", async () => {
+    const browser = new MockBrowser();
+    const delayedContext = new MockContext();
+    const connectOverCDP = vi.fn(async () => {
+      queueMicrotask(() => {
+        browser.addContext(delayedContext);
+      });
+      return browser;
+    });
+    const { manager } = createManager({
+      connectOverCDP,
+    });
+
+    await manager.connectBrowser(
+      "attached",
+      "ws://127.0.0.1:9222/devtools/browser/external-session"
+    );
+    const namedPage = await manager.getPage("attached", "dashboard");
+
+    expect(browser.newContextCalls).toBe(0);
+    expect(delayedContext.newPageCalls).toBe(1);
+    expect(namedPage).toBe(delayedContext.pages()[0]);
   });
 
   it("surfaces a clear error when the websocket probe times out", async () => {
@@ -586,7 +667,9 @@ describe("BrowserManager auto-connect", () => {
         "attached",
         "ws://127.0.0.1:9222/devtools/browser/poisoned"
       );
-      const rejection = expect(connection).rejects.toThrow(/did not respond to Browser\.getVersion/i);
+      const rejection = expect(connection).rejects.toThrow(
+        /did not respond to Browser\.getVersion/i
+      );
       await vi.runAllTicks();
       await vi.advanceTimersByTimeAsync(3_001);
 
@@ -773,7 +856,7 @@ describe("BrowserManager auto-connect", () => {
     const readFile = vi.fn(async (filePath: string) => {
       throw createEnoentError(filePath);
     });
-    const { manager } = createManager({
+    const { manager, createWebSocket } = createManager({
       connectOverCDP,
       fetch,
       readFile,
@@ -786,6 +869,7 @@ describe("BrowserManager auto-connect", () => {
       "http://127.0.0.1:9223/json/version",
     ]);
     expect(connectOverCDP).toHaveBeenCalledWith("ws://127.0.0.1:9223/devtools/browser/discovered");
+    expect(createWebSocket).not.toHaveBeenCalled();
     expect(manager.listBrowsers()).toEqual([
       {
         name: "auto-browser",
@@ -848,7 +932,7 @@ describe("BrowserManager auto-connect", () => {
 
       throw createEnoentError(filePath);
     });
-    const { manager } = createManager({
+    const { manager, createWebSocket } = createManager({
       connectOverCDP,
       fetch,
       homedir: () => homeDir,
@@ -860,6 +944,7 @@ describe("BrowserManager auto-connect", () => {
     expect(connectOverCDP).toHaveBeenCalledTimes(2);
     expect(connectOverCDP).toHaveBeenNthCalledWith(1, staleEndpoint);
     expect(connectOverCDP).toHaveBeenNthCalledWith(2, discoveredEndpoint);
+    expect(createWebSocket).not.toHaveBeenCalled();
     expect(requests).toEqual([
       "http://127.0.0.1:9222/json/version",
       "http://127.0.0.1:9223/json/version",
