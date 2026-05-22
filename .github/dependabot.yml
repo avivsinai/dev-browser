@@ -1,0 +1,77 @@
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    assignees:
+      - "avivsinai"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+
+  - package-ecosystem: "npm"
+    directory: "/daemon"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    assignees:
+      - "avivsinai"
+    groups:
+      npm-dependencies:
+        patterns:
+          - "*"
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+
+  - package-ecosystem: "npm"
+    directory: "/daemon/src/sandbox/forked-client"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    assignees:
+      - "avivsinai"
+    groups:
+      npm-dependencies:
+        patterns:
+          - "*"
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+
+  - package-ecosystem: "npm"
+    directory: "/test/https-server"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    assignees:
+      - "avivsinai"
+    groups:
+      npm-dependencies:
+        patterns:
+          - "*"
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+
+  - package-ecosystem: "cargo"
+    directory: "/cli"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    assignees:
+      - "avivsinai"
+    groups:
+      cargo-dependencies:
+        patterns:
+          - "*"
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+
