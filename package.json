@@ -1,6 +1,6 @@
 {
   "name": "dev-browser",
-  "version": "0.2.5",
+  "version": "0.2.7",
   "description": "CLI for controlling browsers with sandboxed JavaScript scripts",
   "type": "module",
   "bin": {
@@ -19,8 +19,8 @@
     "LICENSE"
   ],
   "dependencies": {
-    "playwright": "^1.52.0",
-    "playwright-core": "^1.52.0",
+    "playwright": "1.58.2",
+    "playwright-core": "1.58.2",
     "quickjs-emscripten": "^0.32.0"
   },
   "keywords": [
